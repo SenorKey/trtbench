@@ -1,8 +1,7 @@
 # trtbench
 
 Real-time object detection deployment pipeline benchmarking YOLOv8 across
-PyTorch, ONNX Runtime, and TensorRT. Cross-platform development (macOS / Windows
-+ RTX 4080) with p50/p95/p99 latency methodology.
+PyTorch, ONNX Runtime, and TensorRT. Cross-platform development (macOS / Windows + RTX 4080) with p50/p95/p99 latency methodology.
 
 > **Status:** In active development. Day 1 baseline (live PyTorch inference) is
 > working; ONNX export, benchmark harness, and TensorRT engine results are
