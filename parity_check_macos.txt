@@ -1,0 +1,9 @@
+[PASS] trial 0: max|Δ|=1.25e-03  p99|Δ|=6.10e-05  mean|Δ|=1.98e-06
+[PASS] trial 1: max|Δ|=1.40e-03  p99|Δ|=6.10e-05  mean|Δ|=2.03e-06
+[PASS] trial 2: max|Δ|=1.19e-03  p99|Δ|=6.10e-05  mean|Δ|=1.97e-06
+[PASS] trial 3: max|Δ|=1.04e-03  p99|Δ|=6.10e-05  mean|Δ|=2.03e-06
+[PASS] trial 4: max|Δ|=1.04e-03  p99|Δ|=6.10e-05  mean|Δ|=1.88e-06
+
+✓ parity check passed across 5 trials
+  worst-case max|Δ|: 1.40e-03
+  tolerances: rtol=0.001, atol=0.0001
