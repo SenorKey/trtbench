@@ -33,9 +33,9 @@ pip install torch torchvision --index-url https://download.pytorch.org/whl/cu121
 ## Roadmap
 
 - [x] Day 1 — Working PyTorch inference loop with FPS overlay
-- [ ] Day 2 — ONNX export and PyTorch parity check
-- [ ] Day 3 — Benchmark harness (warmup, sync, p50/p95/p99)
-- [ ] Day 4 — Cross-machine benchmarks (Mac CPU/MPS, Windows CPU/CUDA)
+- [x] Day 2 — ONNX export and PyTorch parity check
+- [x] Day 3 — Benchmark harness (warmup, sync, p50/p95/p99)
+- [x] Day 4 — Cross-machine benchmarks (Mac CPU/MPS, Windows CPU/CUDA)
 - [ ] Day 5 — TensorRT engine build (FP32, FP16, optional INT8)
 - [ ] Day 6 — Full methodology write-up and results
 
