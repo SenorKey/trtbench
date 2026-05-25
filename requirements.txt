@@ -2,4 +2,4 @@ ultralytics>=8.1.0
 opencv-python>=4.8.0
 onnx
 onnxsim
-onnxruntime
+onnxruntime-gpu
