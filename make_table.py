@@ -32,9 +32,13 @@ def infer_label(system: dict, fallback: str) -> str:
 
 
 def runtime_label(result: dict) -> str:
-    """Build a human-readable runtime label, e.g. 'PyTorch (CUDA)'."""
+    """Build a human-readable runtime label, e.g. 'PyTorch (CUDA)' or
+    'TensorRT (CUDA, FP16)' for engines built at reduced precision."""
     backend = BACKEND_DISPLAY.get(result["backend"], result["backend"])
     device = result["device"].upper()
+    variant = result.get("variant")
+    if variant:
+        return f"{backend} ({device}, {variant.upper()})"
     return f"{backend} ({device})"
 
 
