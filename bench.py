@@ -80,6 +80,13 @@ def get_system_info() -> dict[str, Any]:
         info["ort_providers_available"] = ort.get_available_providers()
     except ImportError:
         info["onnxruntime"] = None
+        
+    try:
+        import tensorrt as trt
+
+        info["tensorrt"] = trt.__version__
+    except ImportError:
+        info["tensorrt"] = None
     return info
 
 
@@ -173,6 +180,101 @@ class ONNXBackend:
     def describe(self) -> dict[str, Any]:
         return {"device": self.device, "active_providers": self.active_providers}
 
+class TensorRTBackend:
+    """Run a TensorRT engine via the native Python API.
+
+    GPU buffers are allocated through torch.cuda (no pycuda dependency),
+    and inference is dispatched with execute_async_v3 on a dedicated stream.
+    The engine's input dtype (FP32 / FP16) is detected from engine metadata,
+    and the input tensor is cast accordingly inside prepare() — outside the
+    timing window — so the benchmark measures pure inference cost.
+    """
+
+    name = "tensorrt"
+
+    def __init__(self, engine_path: str):
+        import tensorrt as trt
+        import torch
+
+        self.torch = torch
+        self.engine_path = engine_path
+        self.device = "cuda"  # TRT engines are NVIDIA-only
+
+        # Deserialize the engine.
+        logger = trt.Logger(trt.Logger.WARNING)
+        runtime = trt.Runtime(logger)
+        # Ultralytics .engine files are not raw TRT engines: they prepend a
+        # 4-byte little-endian length followed by a JSON metadata blob (class
+        # names, input shape, etc., used by AutoBackend to rehydrate the
+        # model). The raw engine bytes follow that header. We strip it
+        # before deserializing so we can use the native TRT runtime directly
+        # without going through AutoBackend's wrapper overhead.
+        with open(engine_path, "rb") as f:
+            meta_len = int.from_bytes(f.read(4), byteorder="little")
+            metadata_json = f.read(meta_len).decode("utf-8")
+            engine_bytes = f.read()
+        self.ultralytics_metadata = json.loads(metadata_json)
+        self.engine = runtime.deserialize_cuda_engine(engine_bytes)
+        if self.engine is None:
+            raise RuntimeError(f"Failed to deserialize engine: {engine_path}")
+        self.context = self.engine.create_execution_context()
+
+        dtype_map = {
+            trt.DataType.FLOAT: torch.float32,
+            trt.DataType.HALF: torch.float16,
+        }
+
+        # Discover I/O tensors; pre-allocate and bind output buffers.
+        self.input_name: str | None = None
+        self.output_tensors: dict[str, Any] = {}
+        for i in range(self.engine.num_io_tensors):
+            name = self.engine.get_tensor_name(i)
+            trt_dtype = self.engine.get_tensor_dtype(name)
+            if trt_dtype not in dtype_map:
+                raise RuntimeError(f"Unsupported TRT dtype on {name}: {trt_dtype}")
+            dtype = dtype_map[trt_dtype]
+            shape = tuple(self.engine.get_tensor_shape(name))
+
+            if self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT:
+                if self.input_name is not None:
+                    raise RuntimeError("Multi-input engines are not supported")
+                self.input_name = name
+                self.input_dtype = dtype
+                self.input_shape = shape
+            else:
+                buf = torch.empty(shape, dtype=dtype, device="cuda")
+                self.output_tensors[name] = buf
+                self.context.set_tensor_address(name, buf.data_ptr())
+
+        if self.input_name is None:
+            raise RuntimeError("Engine has no input tensor")
+
+        self.precision = "fp16" if self.input_dtype == torch.float16 else "fp32"
+        self.stream = torch.cuda.Stream()
+
+    def prepare(self, x_np: np.ndarray):
+        # Move to GPU and cast to engine's expected dtype outside the timing
+        # window. Hold the tensor alive on self so its data pointer stays
+        # valid across the timed inferences.
+        self._input = self.torch.from_numpy(x_np).to(
+            device="cuda", dtype=self.input_dtype
+        )
+        self.context.set_tensor_address(self.input_name, self._input.data_ptr())
+        return self._input
+
+    def infer(self, x):
+        # Buffers are already bound; we only dispatch.
+        self.context.execute_async_v3(self.stream.cuda_stream)
+
+    def sync(self):
+        self.stream.synchronize()
+
+    def describe(self) -> dict[str, Any]:
+        return {
+            "device": self.device,
+            "precision": self.precision,
+            "engine_path": self.engine_path,
+        }
 
 # --------------------------------------------------------------------------
 # Benchmark loop
@@ -222,37 +324,62 @@ def summarize(latencies_ms: list[float]) -> dict[str, float]:
 # --------------------------------------------------------------------------
 
 
-def available_configs(weights_path: Path, onnx_path: Path) -> list[tuple[str, str]]:
-    """Return (backend, device) tuples we can actually run on this machine."""
-    configs: list[tuple[str, str]] = []
+def available_configs(
+    weights_path: Path,
+    onnx_path: Path,
+    engine_fp32_path: Path,
+    engine_fp16_path: Path,
+) -> list[tuple[str, str, str | None]]:
+    """Return (backend, device, variant) tuples we can run on this machine."""
+    configs: list[tuple[str, str, str | None]] = []
     try:
         import torch
 
         if weights_path.exists():
-            configs.append(("pytorch", "cpu"))
+            configs.append(("pytorch", "cpu", None))
             if torch.cuda.is_available():
-                configs.append(("pytorch", "cuda"))
+                configs.append(("pytorch", "cuda", None))
             if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-                configs.append(("pytorch", "mps"))
+                configs.append(("pytorch", "mps", None))
     except ImportError:
         pass
     try:
         import onnxruntime as ort
 
         if onnx_path.exists():
-            configs.append(("onnxruntime", "cpu"))
+            configs.append(("onnxruntime", "cpu", None))
             if "CUDAExecutionProvider" in ort.get_available_providers():
-                configs.append(("onnxruntime", "cuda"))
+                configs.append(("onnxruntime", "cuda", None))
+    except ImportError:
+        pass
+    try:
+        import tensorrt  # noqa: F401
+
+        if engine_fp32_path.exists():
+            configs.append(("tensorrt", "cuda", "fp32"))
+        if engine_fp16_path.exists():
+            configs.append(("tensorrt", "cuda", "fp16"))
     except ImportError:
         pass
     return configs
 
 
-def build_backend(name: str, device: str, weights_path: Path, onnx_path: Path):
+def build_backend(
+    name: str,
+    device: str,
+    variant: str | None,
+    weights_path: Path,
+    onnx_path: Path,
+    engine_fp32_path: Path,
+    engine_fp16_path: Path,
+):
     if name == "pytorch":
         return PyTorchBackend(str(weights_path), device)
     if name == "onnxruntime":
         return ONNXBackend(str(onnx_path), device)
+    if name == "tensorrt":
+        path = engine_fp32_path if variant == "fp32" else engine_fp16_path
+        return TensorRTBackend(str(path))
     raise ValueError(f"Unknown backend: {name}")
 
 
@@ -272,8 +399,19 @@ def main() -> int:
     parser.add_argument("--n-warmup", type=int, default=20)
     parser.add_argument("--n-runs", type=int, default=200)
     parser.add_argument(
+        "--engine-fp32", type=Path, default=Path("yolov8n_fp32.engine")
+    )
+    parser.add_argument(
+        "--engine-fp16", type=Path, default=Path("yolov8n_fp16.engine")
+    )
+    parser.add_argument(
+        "--variant",
+        choices=["fp32", "fp16"],
+        help="For TensorRT, restrict to one precision (default: all available)",
+    )
+    parser.add_argument(
         "--backend",
-        choices=["pytorch", "onnxruntime"],
+        choices=["pytorch", "onnxruntime", "tensorrt"],
         help="Restrict to a single backend (default: all available)",
     )
     parser.add_argument(
@@ -281,6 +419,7 @@ def main() -> int:
         choices=["cpu", "cuda", "mps"],
         help="Restrict to a single device (default: all available)",
     )
+    
     parser.add_argument("--out", type=Path, default=Path("results.json"))
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
@@ -289,16 +428,20 @@ def main() -> int:
     # Same input tensor across every config — fairness depends on it.
     input_np = rng.random((1, 3, args.imgsz, args.imgsz), dtype=np.float32)
 
-    configs = available_configs(args.weights, args.onnx)
+    configs = available_configs(
+        args.weights, args.onnx, args.engine_fp32, args.engine_fp16
+    )
     if args.backend:
-        configs = [(b, d) for b, d in configs if b == args.backend]
+        configs = [c for c in configs if c[0] == args.backend]
     if args.device:
-        configs = [(b, d) for b, d in configs if d == args.device]
+        configs = [c for c in configs if c[1] == args.device]
+    if args.variant:
+        configs = [c for c in configs if c[2] == args.variant]
 
     if not configs:
         print(
-            "No configurations available. Check --weights / --onnx paths and "
-            "that torch / onnxruntime are installed.",
+            "No configurations available. Check --weights / --onnx / --engine-* "
+            "paths and that torch / onnxruntime / tensorrt are installed.",
             file=sys.stderr,
         )
         return 1
@@ -311,17 +454,26 @@ def main() -> int:
     print()
 
     results: list[dict[str, Any]] = []
-    for backend_name, device in configs:
-        label = f"{backend_name}/{device}"
-        print(f"  {label:<22}", end="", flush=True)
+    for backend_name, device, variant in configs:
+        label = f"{backend_name}/{device}" + (f"/{variant}" if variant else "")
+        print(f"  {label:<24}", end="", flush=True)
         try:
-            backend = build_backend(backend_name, device, args.weights, args.onnx)
+            backend = build_backend(
+                backend_name,
+                device,
+                variant,
+                args.weights,
+                args.onnx,
+                args.engine_fp32,
+                args.engine_fp16,
+            )
             latencies = run_benchmark(backend, input_np, args.n_warmup, args.n_runs)
             stats = summarize(latencies)
             results.append(
                 {
                     "backend": backend_name,
                     "device": device,
+                    "variant": variant,
                     "stats": stats,
                     "extra": backend.describe(),
                     "raw_latencies_ms": latencies,
@@ -339,6 +491,7 @@ def main() -> int:
                 {
                     "backend": backend_name,
                     "device": device,
+                    "variant": variant,
                     "error": str(e),
                 }
             )
