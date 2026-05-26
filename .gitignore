@@ -25,5 +25,7 @@ results/
 *.avi
 
 # Ultralytics outputs
-   bus.jpg
-   runs/
+bus.jpg
+runs/
+
+results_*smoke*.json
